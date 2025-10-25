@@ -1,11 +1,40 @@
-from typing import List, Tuple, Union, Iterable
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterable, Sequence
 
 import numpy as np
 import torch
 
-from ..distributions.skew_student_t import HansenSkewedT as HansenSkewedT_torch
+from ..distributions.skew_student_t import HansenSkewedT
 
 
+# -------- Utilities --------
+
+def _validate_time_points(time_points: Iterable[int]) -> np.ndarray:
+    t = np.asarray(list(time_points), dtype=int)
+    if t.size == 0:
+        return t
+    if (t <= 0).any():
+        raise ValueError("All time points must be positive integers.")
+    if np.any(np.diff(t) < 0):
+        raise ValueError("Time points must be sorted in ascending order.")
+    return t
+
+
+def _linspace_tensor(
+    lo: float, hi: float, size: int, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    if not (0.0 <= lo < hi <= 1.0):
+        raise ValueError("Quantile bounds must satisfy 0 <= lo < hi <= 1.")
+    if size <= 0:
+        raise ValueError("`size` must be a positive integer.")
+    return torch.linspace(lo, hi, size, device=device, dtype=dtype)
+
+
+# -------- Reduced / shape-only simulator --------
+
+@dataclass
 class GjrGarchReduced:
     """
     Shape-only (normalized) GJR–GARCH(1,1) simulator.
@@ -15,174 +44,100 @@ class GjrGarchReduced:
         (σ'_{t+1})^2 = ω' + (α + γ * I[ε'_t < 0]) * (ε'_t)^2 + β * (σ'_t)^2
 
     with:
-        κ = α + β + γ * P0,      P0 = E[z^2 | z < 0]
+        κ = α + β + γ * P0,  P0 = E[z^2 | z<0]
         ω' = 1 - κ
-        Initial variance (σ'_0)^2 = initial_variance  (typically 1.0 in the normalized model)
-
-    Notes
-    -----
-    - This is the "reduced / shape-only" engine: mean = 0, long-run variance = 1.
-    - It advances variance from t -> t+1 using the shock realized at time t.
+        (σ'_0)^2 = initial_variance  (typically 1.0)
     """
+    alpha: float
+    gamma: float
+    beta: float
+    initial_variance: float = 1.0
+    eta: float = 100.0
+    lam: float = 0.0
+    device: torch.device | str | None = None
+    dtype: torch.dtype = torch.float32
 
-    def __init__(
-        self,
-        *,
-        alpha: float,
-        gamma: float,
-        beta: float,
-        initial_variance: float = 1.0,
-        eta: float = 100.0,
-        lam: float = 0.0,
-        device: str | torch.device | None = None,
-        dtype: torch.dtype = torch.float32,
-    ):
-        """
-        Parameters
-        ----------
-        alpha, gamma, beta : float
-            GJR–GARCH coefficients.
-        initial_variance : float, optional
-            Initial normalized variance (σ'_0)^2. Default 1.0.
-        eta : float, optional
-            Degrees of freedom for Hansen's skewed Student-t distribution. Default 100.0.
-        lam : float, optional
-            Skewness parameter for Hansen's skewed Student-t distribution. Default 0.0.
-        device : str | torch.device | None, optional
-            PyTorch device for computations. Default 'cpu'.
-        dtype : torch.dtype, optional
-            Data type for returned tensors. Default torch.float32.
-        """
-        self.alpha = float(alpha)
-        self.gamma = float(gamma)
-        self.beta = float(beta)
-        self.sigma0_sq = float(initial_variance)
+    # runtime state (private)
+    _eps: float = field(default=1e-8, init=False, repr=False)
+    _ti: int = field(default=0, init=False, repr=False)
+    _var: torch.Tensor | None = field(default=None, init=False, repr=False)          # (σ'_t)^2
+    _cum_returns: torch.Tensor | None = field(default=None, init=False, repr=False)  # Σ r'_s
+    dist: HansenSkewedT = field(init=False, repr=False)
+    P0: float = field(init=False)
+    kappa: float = field(init=False)
+    omega: float = field(init=False)  # ω' = 1 - κ
 
-        self.device = torch.device(device) if device else torch.device("cpu")
-        self.dtype = dtype
-        self._eps = 1e-8
+    def __post_init__(self) -> None:
+        self.device = torch.device(self.device) if self.device is not None else torch.device("cpu")
+        self.alpha = float(self.alpha)
+        self.beta = float(self.beta)
+        self.gamma = float(self.gamma)
+        self.initial_variance = float(self.initial_variance)
 
-        # Create HansenSkewedT distribution internally
-        self.dist = HansenSkewedT_torch(eta=eta, lam=lam, device=self.device)
+        # Distribution and moments
+        self.dist = HansenSkewedT(eta=float(self.eta), lam=float(self.lam), device=self.device)
+        self.P0 = float(self.dist.second_moment_left())  # E[z^2 | z<0]
 
-        P0 = self.dist.second_moment_left()  # E[z^2 | z<0]
-        self.P0 = P0
-        self.kappa = self.alpha + self.beta + self.gamma * P0
+        # Stationarity / parameters
+        self.kappa = self.alpha + self.beta + self.gamma * self.P0
         if not (self.kappa < 1.0):
-            raise ValueError(f"Stationarity violated: kappa={self.kappa} >= 1.")
-        self.omega = 1.0 - self.kappa  # ω' in normalized model
+            raise ValueError(f"Stationarity violated: kappa={self.kappa:.6g} >= 1.")
+        self.omega = 1.0 - self.kappa
 
-        # Runtime state
-        self._ti: int = 0
-        self._var: torch.Tensor | None = None  # (σ'_t)^2
-        self._cum_returns: torch.Tensor | None = None  # sum of r'_t
+    # ---- internal stepping ----
 
     def _reset(self, num_paths: int) -> None:
-        """
-        Initialize (or reinitialize) the simulator state.
-
-        Parameters
-        ----------
-        num_paths : int
-            Number of independent paths to simulate in parallel.
-        """
         self._ti = 0
-        sigma0_sq = max(self.sigma0_sq, self._eps)
-        self._var = torch.full((num_paths,), sigma0_sq, device=self.device, dtype=self.dtype)
+        iv = max(self.initial_variance, self._eps)
+        self._var = torch.full((num_paths,), iv, device=self.device, dtype=self.dtype)
         self._cum_returns = torch.zeros((num_paths,), device=self.device, dtype=self.dtype)
 
+    def _require_state(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._var is None or self._cum_returns is None:
+            raise RuntimeError("Simulator state is uninitialized. Call `_reset(num_paths)` first.")
+        return self._var, self._cum_returns
+
     def _step(self) -> tuple[torch.Tensor, int]:
-        """
-        Advance the simulation by one time step.
-
-        Returns
-        -------
-        cum_returns : torch.Tensor, shape (num_paths,)
-            Cumulative normalized returns Σ_{s=1}^t r'_s after this step.
-        t : int
-            Current time index (1-based).
-        """
         self._ti += 1
+        var, cum = self._require_state()
 
-        # Draw standardized shocks z_t and form ε'_t
-        num_paths = self._var.shape[0]
-        z = self.dist.rvs(num_paths)  # shape (num_paths,)
-        if self._var is None:
-            raise ValueError("Variance not initialized")
-        shock = z * torch.sqrt(self._var)  # ε'_t
+        z = self.dist.rvs(var.shape[0])  # standardized shocks
+        shock = z * torch.sqrt(var)      # ε'_t
 
-        # Update cumulative return r'
-        self._cum_returns += shock
+        # cum returns
+        cum += shock
 
-        # Update variance to (t+1) using ε'_t
-        is_negative = (shock < 0).to(self._var.dtype)
-        self._var = (
-            self.omega
-            + (self.alpha + self.gamma * is_negative) * shock.pow(2)
-            + self.beta * self._var
-        )
-        self._var = torch.clamp(self._var, min=self._eps)
+        # variance update to t+1
+        is_neg = (shock < 0).to(var.dtype)
+        var = self.omega + (self.alpha + self.gamma * is_neg) * shock.square() + self.beta * var
+        self._var = torch.clamp(var, min=self._eps)
 
-        return self._cum_returns, self._ti
+        return cum, self._ti
 
-    def paths(
-        self, 
-        time_points: Iterable[Union[int, float]],
-        num_paths: int
-    ) -> torch.Tensor:
+    # ---- public API ----
+
+    def paths(self, time_points: Iterable[int], num_paths: int) -> torch.Tensor:
         """
-        Simulate paths up to specified time points and return cumulative returns.
-
-        Parameters
-        ----------
-        time_points : array-like
-            List or array of integers representing time steps (must be sorted).
-            E.g., [4, 10, 12] will return cumulative returns after 4, 10, and 12 steps.
-        num_paths : int
-            Number of Monte Carlo paths to simulate.
-
-        Returns
-        -------
-        torch.Tensor, shape (len(time_points), num_paths)
-            Cumulative returns at each specified time point.
-            First row contains cum_returns after time_points[0] steps, etc.
+        Returns cumulative normalized returns at requested times.
+        Shape: (len(time_points), num_paths)
         """
-        import numpy as np
-
-        t = np.asarray(time_points)
-        if len(t) == 0:
+        t = _validate_time_points(time_points)
+        if t.size == 0:
             return torch.empty((0, num_paths), device=self.device, dtype=self.dtype)
 
-        # Ensure t is sorted
-        if not np.all(np.diff(t) >= 0):
-            raise ValueError("Time points must be sorted in ascending order")
-
-        # Ensure all time points are positive
-        if np.any(t <= 0):
-            raise ValueError("All time points must be positive")
-
-        # Reset to beginning
         self._reset(num_paths)
+        out = torch.empty((len(t), num_paths), device=self.device, dtype=self.dtype)
 
-        # Initialize result tensor
-        result = torch.empty((len(t), num_paths), device=self.device, dtype=self.dtype)
-
-        # Simulate up to each time point
         for i, target_t in enumerate(t):
-            # Simulate from current time to target time
-            while self._ti < target_t:
+            while self._ti < int(target_t):
                 self._step()
+            out[i] = self._require_state()[1]  # cumulative returns
 
-            # Store cumulative returns at this time point
-            if self._cum_returns is None:
-                raise ValueError("Cumulative returns not initialized")
-            result[i] = self._cum_returns
-
-        return result
+        return out
 
     def quantiles(
         self,
-        time_points: Iterable[Union[int, float]],
+        time_points: Iterable[int],
         num_paths: int,
         lo: float = 0.001,
         hi: float = 0.999,
@@ -190,256 +145,131 @@ class GjrGarchReduced:
         center: bool = True,
     ) -> torch.Tensor:
         """
-        Compute quantiles of cumulative returns at specified time points.
-
-        Parameters
-        ----------
-        time_points : array-like
-            List or array of integers representing time steps (must be sorted).
-            E.g., [4, 10, 12] will return quantiles after 4, 10, and 12 steps.
-        num_paths : int
-            Number of Monte Carlo paths to simulate.
-        lo : float, default 0.001
-            Lower quantile bound (e.g., 0.001 for 0.1th percentile).
-        hi : float, default 0.999
-            Upper quantile bound (e.g., 0.999 for 99.9th percentile).
-        size : int, default 512
-            Number of quantiles to compute between lo and hi.
-        center : bool, default True
-            If True, subtract the average of cum_returns before computing quantiles.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape (len(time_points), size) containing quantiles at each specified time point.
-            First row contains quantiles after time_points[0] steps, etc.
+        Row i contains quantiles of Σ r'_s at time_points[i].
+        Shape: (len(time_points), size)
+        
+        Memory-efficient implementation: computes quantiles step-by-step
+        without materializing all paths.
         """
-        import numpy as np
-
-        t = np.asarray(time_points)
-        if len(t) == 0:
+        t = _validate_time_points(time_points)
+        if t.size == 0:
             return torch.empty((0, size), device=self.device, dtype=self.dtype)
 
-        # Validate time points
-        if not np.all(t > 0):
-            raise ValueError("All time points must be positive")
-        if not np.all(np.diff(t) >= 0):
-            raise ValueError("Time points must be sorted")
-
-        # Validate quantile bounds
-        if not (0 <= lo < hi <= 1):
-            raise ValueError("Quantile bounds must satisfy 0 <= lo < hi <= 1")
-
-        # Generate paths
-        paths = self.paths(time_points, num_paths)
-
-        # Compute quantiles
-        quantile_levels = torch.linspace(lo, hi, size, device=self.device, dtype=self.dtype)
+        q_levels = _linspace_tensor(lo, hi, size, device=self.device, dtype=self.dtype)
+        
+        # Initialize result tensor
         result = torch.empty((len(t), size), device=self.device, dtype=self.dtype)
-
-        for i in range(len(t)):
-            path_values = paths[i, :]
-            if center:
-                path_values = path_values - path_values.mean()
-            result[i] = torch.quantile(path_values, quantile_levels)
-
+        
+        # Reset simulator
+        self._reset(num_paths)
+        
+        # Track which time points we need to collect and current result index
+        target_times = set(t)
+        result_idx = 0
+        
+        # Step through simulation
+        while self._ti < max(t):
+            self._step()
+            
+            # Check if current time is one we need
+            if self._ti in target_times:
+                cum_returns = self._require_state()[1]  # Get cumulative returns
+                
+                if center:
+                    cum_returns = cum_returns - cum_returns.mean()
+                
+                # Compute quantiles for this time point
+                result[result_idx] = torch.quantile(cum_returns, q_levels)
+                result_idx += 1
+        
         return result
 
 
+# -------- Full / raw simulator (thin wrapper) --------
+
+@dataclass
 class GjrGarch:
     """
-    Full GJR–GARCH(1,1) simulator with mean and variance parameters.
+    Full GJR–GARCH(1,1) simulator with mean and raw variance.
 
-    Model (raw):
-        r_t = μ + ε_t,    ε_t = σ_t z_t,   z_t ~ S_t_{ν,λ}(0,1)
-        σ_{t+1}^2 = ω + (α + γ * I[ε_t < 0]) * ε_t^2 + β * σ_t^2
-
-    with:
-        κ = α + β + γ * P0,      P0 = E[z^2 | z < 0]
-        v = ω / (1 - κ)          (long-run variance)
-        Initial variance σ_0^2 = initial_variance
-
-    Notes
-    -----
-    - This is the "full" engine: includes mean μ and raw variance parameters.
-    - It uses GjrGarchReduced internally for the normalized simulation.
-    - The mapping is:
-        α'    = α,    β'    = β,    γ'    = γ
-        ω'    = 1 - κ
-        r_t   = μ + √v * r'_t
-        σ_t^2 = v * (σ'_t)^2
+    Mapping to reduced model:
+        α' = α, β' = β, γ' = γ, ω' = 1 - κ
+        v = ω / (1 - κ),  r_t = μ + √v * r'_t,  σ_t^2 = v * (σ'_t)^2
     """
+    mu: float
+    omega: float
+    alpha: float
+    gamma: float
+    beta: float
+    initial_variance: float
+    eta: float = 100.0
+    lam: float = 0.0
+    device: torch.device | str | None = None
+    dtype: torch.dtype = torch.float32
+    reduced_engine_cls: type[GjrGarchReduced] = GjrGarchReduced
 
-    def __init__(
-        self,
-        *,
-        mu: float,
-        omega: float,
-        alpha: float,
-        gamma: float,
-        beta: float,
-        initial_variance: float,
-        eta: float = 100.0,
-        lam: float = 0.0,
-        device: str | torch.device | None = None,
-        dtype: torch.dtype = torch.float32,
-        reduced_engine_cls: type = GjrGarchReduced,
-    ):
-        """
-        Parameters
-        ----------
-        mu, omega, alpha, gamma, beta : float
-            Raw GJR–GARCH parameters.
-        initial_variance : float
-            Initial raw variance σ_0^2.
-        eta : float, optional
-            Degrees of freedom for Hansen's skewed Student-t distribution. Default 100.0.
-        lam : float, optional
-            Skewness parameter for Hansen's skewed Student-t distribution. Default 0.0.
-        device : str | torch.device | None, optional
-            PyTorch device for computations. Default 'cpu'.
-        dtype : torch.dtype, optional
-            Data type for returned tensors. Default torch.float32.
-        reduced_engine_cls : type
-            Class implementing the reduced model (default: GjrGarchReduced).
-        """
-        self.mu = float(mu)
-        self.omega = float(omega)
-        self.alpha = float(alpha)
-        self.gamma = float(gamma)
-        self.beta = float(beta)
-        self.sigma0_sq = float(initial_variance)
+    # derived
+    reduced: GjrGarchReduced = field(init=False, repr=False)
+    kappa: float = field(init=False)
+    v: float = field(init=False)
+    sqrt_v: float = field(init=False)
 
-        self.device = torch.device(device) if device else torch.device("cpu")
-        self.dtype = dtype
-        self._eps = 1e-8
+    def __post_init__(self) -> None:
+        self.device = torch.device(self.device) if self.device is not None else torch.device("cpu")
+        self.mu = float(self.mu)
+        self.omega = float(self.omega)
+        self.alpha = float(self.alpha)
+        self.beta = float(self.beta)
+        self.gamma = float(self.gamma)
+        self.initial_variance = float(self.initial_variance)
 
-        # Build reduced engine first (it will create the HansenSkewedT distribution)
-        self.reduced = reduced_engine_cls(
+        # Build reduced engine; it owns the distribution and P0
+        self.reduced = self.reduced_engine_cls(
             alpha=self.alpha,
             gamma=self.gamma,
             beta=self.beta,
-            initial_variance=1.0,  # Will be normalized below
-            eta=eta,
-            lam=lam,
+            initial_variance=1.0,  # placeholder; we set the correct normalized σ0^2 below
+            eta=self.eta,
+            lam=self.lam,
             device=self.device,
             dtype=self.dtype,
         )
 
-        # Get P0 from the reduced engine's distribution
-        P0 = self.reduced.dist.second_moment_left()
-        self.kappa = self.alpha + self.beta + self.gamma * P0
+        # Stationarity via reduced.P0
+        self.kappa = self.alpha + self.beta + self.gamma * self.reduced.P0
         if not (self.kappa < 1.0):
-            raise ValueError(f"Stationarity violated: kappa={self.kappa} >= 1.")
+            raise ValueError(f"Stationarity violated: kappa={self.kappa:.6g} >= 1.")
 
-        # Long-run variance v
-        self.v = self.omega / (1.0 - self.kappa)
+        # Long-run variance v and normalized initial variance
+        denom = (1.0 - self.kappa)
+        self.v = self.omega / denom
         if not (self.v > 0.0):
-            raise ValueError(f"Long-run variance must be positive; got v={self.v}.")
-        self.sqrt_v = float(self.v**0.5)
+            raise ValueError(f"Long-run variance must be positive; got v={self.v:.6g}.")
+        self.sqrt_v = float(self.v ** 0.5)
 
-        # Update reduced engine with correct normalized initial variance
-        sigma0_sq_reduced = max(self.sigma0_sq / self.v, self._eps)
-        self.reduced.sigma0_sq = sigma0_sq_reduced
-        self.reduced.omega = 1.0 - self.kappa  # Update omega in reduced engine
+        # Configure reduced engine parameters that depend on κ and v
+        self.reduced.omega = 1.0 - self.kappa
+        self.reduced.initial_variance = max(self.initial_variance / self.v, self.reduced._eps)
 
-        # Raw state mirrors reduced state (but mapped back to raw units)
-        self._ti: int = 0
-        self._var: torch.Tensor | None = None  # raw σ_t^2
+    # ---- public API: thin mapping to reduced ----
 
-    def _reset(self, num_paths: int) -> None:
-        """Initialize (or reinitialize) the simulator state."""
-        self._ti = 0
-        self.reduced._reset(num_paths)
-        # Map reduced variance to raw variance: σ_t^2 = v * (σ'_t)^2
-        if self.reduced._var is None:
-            raise ValueError("Reduced variance not initialized")
-        self._var = self.reduced._var * self.v
-
-    def _step(self) -> tuple[torch.Tensor, int]:
+    def paths(self, time_points: Iterable[int], num_paths: int) -> torch.Tensor:
         """
-        Advance the simulation by one time step.
-
-        Returns
-        -------
-        cum_returns : torch.Tensor, shape (num_paths,)
-            Cumulative raw returns Σ_{s=1}^t r_s after this step.
-        t : int
-            Current time index (1-based).
+        Returns cumulative raw returns at requested times.
+        Shape: (len(time_points), num_paths)
         """
-        self._ti += 1
-
-        # Step the reduced model
-        reduced_cum_returns, _ = self.reduced._step()
-
-        # Map back to raw units: r_t = μ + √v * r'_t
-        raw_cum_returns = self.mu * self._ti + self.sqrt_v * reduced_cum_returns
-
-        # Update raw variance: σ_t^2 = v * (σ'_t)^2
-        if self.reduced._var is None:
-            raise ValueError("Reduced variance not initialized")
-        self._var = self.v * self.reduced._var
-
-        return raw_cum_returns, self._ti
-
-    def paths(
-        self, 
-        time_points: Iterable[Union[int, float]],
-        num_paths: int
-    ) -> torch.Tensor:
-        """
-        Simulate paths up to specified time points and return cumulative returns.
-
-        Parameters
-        ----------
-        time_points : array-like
-            List or array of integers representing time steps (must be sorted).
-            E.g., [4, 10, 12] will return cumulative returns after 4, 10, and 12 steps.
-        num_paths : int
-            Number of Monte Carlo paths to simulate.
-
-        Returns
-        -------
-        torch.Tensor, shape (len(time_points), num_paths)
-            Cumulative returns at each specified time point.
-            First row contains cum_returns after time_points[0] steps, etc.
-        """
-        import numpy as np
-
-        t = np.asarray(time_points)
-        if len(t) == 0:
+        t = _validate_time_points(time_points)
+        if t.size == 0:
             return torch.empty((0, num_paths), device=self.device, dtype=self.dtype)
 
-        # Ensure t is sorted
-        if not np.all(np.diff(t) >= 0):
-            raise ValueError("Time points must be sorted in ascending order")
-
-        # Ensure all time points are positive
-        if np.any(t <= 0):
-            raise ValueError("All time points must be positive")
-
-        # Reset to beginning
-        self._reset(num_paths)
-
-        # Initialize result tensor
-        result = torch.empty((len(t), num_paths), device=self.device, dtype=self.dtype)
-
-        # Simulate up to each time point
-        for i, target_t in enumerate(t):
-            # Simulate from current time to target time
-            while self._ti < target_t:
-                self._step()
-
-            # Store cumulative returns at this time point
-            if self._var is None:
-                raise ValueError("Variance not initialized")
-            result[i] = self.mu * self._ti + self.sqrt_v * self.reduced._cum_returns
-
-        return result
+        reduced_paths = self.reduced.paths(t, num_paths)  # (T, N)
+        # r_t = μ * t + √v * r'_t  (broadcast t over paths)
+        t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype).unsqueeze(1)
+        return self.mu * t_tensor + self.sqrt_v * reduced_paths
 
     def quantiles(
         self,
-        time_points: Iterable[Union[int, float]],
+        time_points: Iterable[int],
         num_paths: int,
         lo: float = 0.001,
         hi: float = 0.999,
@@ -447,57 +277,20 @@ class GjrGarch:
         center: bool = True,
     ) -> torch.Tensor:
         """
-        Compute quantiles of cumulative returns at specified time points.
-
-        Parameters
-        ----------
-        time_points : array-like
-            List or array of integers representing time steps (must be sorted).
-            E.g., [4, 10, 12] will return quantiles after 4, 10, and 12 steps.
-        num_paths : int
-            Number of Monte Carlo paths to simulate.
-        lo : float, default 0.001
-            Lower quantile bound (e.g., 0.001 for 0.1th percentile).
-        hi : float, default 0.999
-            Upper quantile bound (e.g., 0.999 for 99.9th percentile).
-        size : int, default 512
-            Number of quantiles to compute between lo and hi.
-        center : bool, default True
-            If True, subtract the average of cum_returns before computing quantiles.
-
-        Returns
-        -------
-        torch.Tensor
-            Shape (len(time_points), size) containing quantiles at each specified time point.
-            First row contains quantiles after time_points[0] steps, etc.
+        Row i contains quantiles of Σ r_s at time_points[i].
+        Shape: (len(time_points), size)
         """
-        import numpy as np
-
-        t = np.asarray(time_points)
-        if len(t) == 0:
+        t = _validate_time_points(time_points)
+        if t.size == 0:
             return torch.empty((0, size), device=self.device, dtype=self.dtype)
 
-        # Validate time points
-        if not np.all(t > 0):
-            raise ValueError("All time points must be positive")
-        if not np.all(np.diff(t) >= 0):
-            raise ValueError("Time points must be sorted")
+        # We can map quantiles directly without simulating raw paths:
+        # - If center=False: Q_raw = μ * t + √v * Q_reduced
+        # - If center=True:  Q_raw_centered = √v * Q_reduced_centered
+        reduced_q = self.reduced.quantiles(t, num_paths, lo=lo, hi=hi, size=size, center=center)
 
-        # Validate quantile bounds
-        if not (0 <= lo < hi <= 1):
-            raise ValueError("Quantile bounds must satisfy 0 <= lo < hi <= 1")
+        if center:
+            return self.sqrt_v * reduced_q
 
-        # Generate paths
-        paths = self.paths(time_points, num_paths)
-
-        # Compute quantiles
-        quantile_levels = torch.linspace(lo, hi, size, device=self.device, dtype=self.dtype)
-        result = torch.empty((len(t), size), device=self.device, dtype=self.dtype)
-
-        for i in range(len(t)):
-            path_values = paths[i, :]
-            if center:
-                path_values = path_values - path_values.mean()
-            result[i] = torch.quantile(path_values, quantile_levels)
-
-        return result
+        t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype).unsqueeze(1)
+        return self.mu * t_tensor + self.sqrt_v * reduced_q

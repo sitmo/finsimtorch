@@ -29,7 +29,7 @@ class TestGjrGarch:
         assert model.alpha == 0.1
         assert model.gamma == 0.05
         assert model.beta == 0.8
-        assert model.sigma0_sq == 1.0
+        assert model.initial_variance == 1.0
         assert model.device == torch.device('cpu')
         assert model.dtype == torch.float32
     
@@ -88,7 +88,7 @@ class TestGjrGarchReduced:
         assert model.alpha == 0.1
         assert model.gamma == 0.05
         assert model.beta == 0.8
-        assert model.sigma0_sq == 1.0
+        assert model.initial_variance == 1.0
         assert model.device == torch.device('cpu')
         assert model.dtype == torch.float32
     

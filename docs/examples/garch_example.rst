@@ -18,7 +18,7 @@ This example demonstrates how to use the GJR-GARCH model for simulating financia
        alpha=0.1,
        gamma=0.05,
        beta=0.8,
-       sigma0_sq=1.0,
+       initial_variance=1.0,
        dist=dist
    )
    

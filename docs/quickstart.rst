@@ -32,7 +32,7 @@ Let's start with a simple example using the GJR-GARCH model:
        alpha=0.1,        # ARCH coefficient
        gamma=0.05,       # Asymmetry coefficient
        beta=0.8,         # GARCH coefficient
-       sigma0_sq=1.0,    # Initial variance
+       initial_variance=1.0,    # Initial variance
        dist=dist
    )
    

@@ -34,7 +34,7 @@ Quick Start
    dist = HansenSkewedT(eta=10.0, lam=0.1)
    model = GJRGARCH_torch(
        mu=0.0, omega=0.1, alpha=0.1, gamma=0.05, beta=0.8,
-       sigma0_sq=1.0, dist=dist
+       initial_variance=1.0, dist=dist
    )
    
    # Simulate paths
